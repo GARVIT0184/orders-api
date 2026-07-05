@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -11,9 +11,9 @@ TOTAL_ORDERS = 46
 RATE_LIMIT = 16
 WINDOW = 10
 
-# -----------------------------
+# -------------------------
 # CORS
-# -----------------------------
+# -------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,78 +22,80 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
+# -------------------------
 # Storage
-# -----------------------------
-idempotency_store = {}
-clients = {}
+# -------------------------
+orders_by_key = {}
+client_requests = {}
 
-# -----------------------------
-# 429 Exception Handler
-# -----------------------------
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    if exc.status_code == 429:
-        return JSONResponse(
-            status_code=429,
-            content={"detail": exc.detail},
-            headers={"Retry-After": "10"},
-        )
-
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
-
-# -----------------------------
+# -------------------------
 # Rate Limiter
-# -----------------------------
-def check_rate_limit(client_id: str):
+# -------------------------
+def rate_limit(request: Request):
+    client_id = request.headers.get("X-Client-ID", "anonymous")
     now = time.time()
 
-    if client_id not in clients:
-        clients[client_id] = []
+    if client_id not in client_requests:
+        client_requests[client_id] = []
 
-    clients[client_id] = [
-        t for t in clients[client_id]
+    # Keep only requests in last WINDOW seconds
+    client_requests[client_id] = [
+        t for t in client_requests[client_id]
         if now - t < WINDOW
     ]
 
-    if len(clients[client_id]) >= RATE_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded"
+    if len(client_requests[client_id]) >= RATE_LIMIT:
+        retry_after = max(
+            1,
+            int(WINDOW - (now - client_requests[client_id][0]))
         )
 
-    clients[client_id].append(now)
+        return JSONResponse(
+            status_code=429,
+            headers={
+                "Retry-After": str(retry_after)
+            },
+            content={
+                "detail": "Rate limit exceeded"
+            }
+        )
 
-# -----------------------------
+    client_requests[client_id].append(now)
+    return None
+
+
+# -------------------------
 # POST /orders
-# -----------------------------
+# -------------------------
 @app.post("/orders", status_code=201)
 async def create_order(
     request: Request,
     idempotency_key: str = Header(..., alias="Idempotency-Key")
 ):
 
-    client_id = request.headers.get("X-Client-ID", "anonymous")
-    check_rate_limit(client_id)
+    limited = rate_limit(request)
+    if limited:
+        return limited
 
-    if idempotency_key in idempotency_store:
-        return idempotency_store[idempotency_key]
+    if idempotency_key in orders_by_key:
+        return orders_by_key[idempotency_key]
 
     order = {
-        "id": len(idempotency_store) + 1,
+        "id": len(orders_by_key) + 1,
         "email": EMAIL
     }
 
-    idempotency_store[idempotency_key] = order
+    orders_by_key[idempotency_key] = order
 
-    return order
+    return JSONResponse(
+        status_code=201,
+        content=order
+    )
 
-# -----------------------------
+
+# -------------------------
 # GET /orders
-# -----------------------------
+# -------------------------
 @app.get("/orders")
 async def get_orders(
     request: Request,
@@ -101,13 +103,14 @@ async def get_orders(
     cursor: Optional[str] = None
 ):
 
-    client_id = request.headers.get("X-Client-ID", "anonymous")
-    check_rate_limit(client_id)
+    limited = rate_limit(request)
+    if limited:
+        return limited
 
     if limit < 1:
         limit = 1
 
-    start = int(cursor) if cursor else 1
+    start = 1 if cursor is None else int(cursor)
 
     if start < 1:
         start = 1
@@ -117,6 +120,7 @@ async def get_orders(
     items = [{"id": i} for i in range(start, end + 1)]
 
     next_cursor = None
+
     if end < TOTAL_ORDERS:
         next_cursor = str(end + 1)
 
@@ -125,9 +129,12 @@ async def get_orders(
         "next_cursor": next_cursor
     }
 
-# -----------------------------
-# Health Check
-# -----------------------------
+
+# -------------------------
+# Root
+# -------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
