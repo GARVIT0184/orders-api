@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
@@ -6,30 +6,47 @@ import time
 
 app = FastAPI()
 
-# -----------------------------
-# CORS
-# -----------------------------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://exam.sanand.workers.dev",
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 EMAIL = "24f2006741@ds.study.iitm.ac.in"
 TOTAL_ORDERS = 46
 RATE_LIMIT = 16
 WINDOW = 10
 
-orders = []
+# -----------------------------
+# CORS
+# -----------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------
+# Storage
+# -----------------------------
 idempotency_store = {}
 clients = {}
 
 # -----------------------------
-# Rate limit helper
+# 429 Exception Handler
+# -----------------------------
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == 429:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": exc.detail},
+            headers={"Retry-After": "10"},
+        )
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+# -----------------------------
+# Rate Limiter
 # -----------------------------
 def check_rate_limit(client_id: str):
     now = time.time()
@@ -43,16 +60,12 @@ def check_rate_limit(client_id: str):
     ]
 
     if len(clients[client_id]) >= RATE_LIMIT:
-        response = JSONResponse(
+        raise HTTPException(
             status_code=429,
-            content={"detail": "Rate limit exceeded"},
+            detail="Rate limit exceeded"
         )
-        response.headers["Retry-After"] = "10"
-        return response
 
     clients[client_id].append(now)
-    return None
-
 
 # -----------------------------
 # POST /orders
@@ -60,14 +73,11 @@ def check_rate_limit(client_id: str):
 @app.post("/orders", status_code=201)
 async def create_order(
     request: Request,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key")
 ):
 
     client_id = request.headers.get("X-Client-ID", "anonymous")
-
-    limited = check_rate_limit(client_id)
-    if limited:
-        return limited
+    check_rate_limit(client_id)
 
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
@@ -81,24 +91,27 @@ async def create_order(
 
     return order
 
-
 # -----------------------------
 # GET /orders
 # -----------------------------
 @app.get("/orders")
-async def list_orders(
+async def get_orders(
     request: Request,
     limit: int = 10,
-    cursor: Optional[str] = None,
+    cursor: Optional[str] = None
 ):
 
     client_id = request.headers.get("X-Client-ID", "anonymous")
+    check_rate_limit(client_id)
 
-    limited = check_rate_limit(client_id)
-    if limited:
-        return limited
+    if limit < 1:
+        limit = 1
 
     start = int(cursor) if cursor else 1
+
+    if start < 1:
+        start = 1
+
     end = min(start + limit - 1, TOTAL_ORDERS)
 
     items = [{"id": i} for i in range(start, end + 1)]
@@ -109,5 +122,12 @@ async def list_orders(
 
     return {
         "items": items,
-        "next_cursor": next_cursor,
+        "next_cursor": next_cursor
     }
+
+# -----------------------------
+# Health Check
+# -----------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok"}
